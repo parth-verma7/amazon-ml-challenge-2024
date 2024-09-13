@@ -1,42 +1,85 @@
 import os
 import ray
 import time
+import pandas as pd
 from paddleocr import PaddleOCR
 
 if not ray.is_initialized():
     ray.init()
 
-files=[]
-for filename in os.listdir("./images"):
-    file_path = os.path.join("./images", filename)
-    files.append(file_path)
-
 start_time = time.time()
-formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
-print(f"Start time: {formatted_time}")
+start_formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+print(f"Start time: {start_formatted_time}")
+
 
 @ray.remote
-def PaddleOCRLocal(file_path):
-    label = None
-    ocr_model = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-    text_result = ocr_model.ocr(file_path)
+class StructureActor:
+    def __init__(self):
+        self.df=pd.DataFrame(columns=["file_path", "group_id", "entity_name", "entity_value","entity_text"])
 
-    final=""
+    def update_df(self, new_row):
+        self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
 
-    for item in text_result:
-        for sub_item in item:
-            label = sub_item[1][0]
-            final+=" "+label
+    def get_df(self):
+        return self.df
 
-    return str(final)
+
+@ray.remote
+def PaddleOCRLocal(row):
+    try:
+        file_path=row['image_path']
+        group_id=row['group_id']
+        entity_name=row['entity_name']
+        entity_value=row['entity_value']
+        print(entity_value)
+
+        label = None
+    
+        ocr_model = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+        text_result = ocr_model.ocr(file_path)
+
+        final_text=""
+
+        for item in text_result:
+            for sub_item in item:
+                label = sub_item[1][0]
+                final_text+=" "+label
+
+        final={
+            "file_path":file_path,
+            "group_id": group_id,
+            "entity_name": entity_name,
+            "entity_value": entity_value,
+            "entity_text":str(final_text)
+        }
+
+        return final
+
+    except Exception as e:
+        final={
+            "file_path":"",
+            "group_id": "",
+            "entity_name": "",
+            "entity_value": "",
+            "entity_text":""
+        }
+        print("Exception:", e)
+        return final
 
 batch_size = 20
-for i in range(0, len(files), batch_size):
-    batch_files = files[i:i + batch_size]
-    futures = [PaddleOCRLocal.remote(filepath) for filepath in batch_files]
+df=pd.read_csv('img_path_dataset.csv')
+structure_actor=StructureActor.remote()
+
+for i in range(0, df.shape[0], batch_size):
+    new_df=df.iloc[i:i + batch_size]
+    futures = [PaddleOCRLocal.remote(row) for _, row in new_df.iterrows()]
     results=ray.get(futures)
-    print(results)
+    for result in results:
+        structure_actor.update_df.remote(result)
 
 end_time=time.time()
-formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time))
-print(f"Start time: {formatted_time}")
+end_formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time))
+print(f"End time: {end_formatted_time}")
+
+final_df=ray.get(structure_actor.get_df.remote())
+final_df.to_csv("final_df.csv", index=False)
